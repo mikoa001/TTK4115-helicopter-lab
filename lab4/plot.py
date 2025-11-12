@@ -26,7 +26,7 @@ from typing import Iterable, Tuple, List, Optional
 import numpy as np
 from scipy.io import loadmat
 
-ANS_LABELS = ["lambda", "lambda_dot", "pitch", "pitch_dot", "elevation", "elevation_dot"]
+ANS_LABELS = ["pitch", "pitch_dot", "elevation", "elevation_dot", "lambda", "lambda_dot"]
 
 
 def is_numeric_array(obj) -> bool:

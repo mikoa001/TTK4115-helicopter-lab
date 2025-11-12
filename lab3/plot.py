@@ -18,6 +18,7 @@ Examples (PowerShell):
 """
 from __future__ import annotations
 
+from email import parser
 from pathlib import Path
 import argparse
 import logging
@@ -26,7 +27,7 @@ from typing import Iterable, Tuple, List, Optional
 import numpy as np
 from scipy.io import loadmat
 
-ANS_LABELS = ["lambda", "lambda_dot", "pitch", "pitch_dot", "elevation", "elevation_dot"]
+ANS_LABELS = ["pitch", "pitch_dot", "elevation", "elevation_dot", "lambda_dot"]
 
 
 def is_numeric_array(obj) -> bool:
@@ -49,28 +50,59 @@ def find_time_vector(data: dict) -> tuple[Optional[np.ndarray], Optional[str]]:
 
 
 def load_ans_layout(data: dict) -> tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[List[str]]]:
-    """If 'ans' has the expected layout, return (t, states[6,N], labels)."""
+    """If 'ans' has expected layout (time + 5 or 6 states), return (t, states[ns,N], labels)."""
     if "ans" not in data or not is_numeric_array(data["ans"]):
         return None, None, None
     A = np.asarray(data["ans"])
     if A.ndim != 2:
         return None, None, None
 
-    # Accept (7, N) or (N, 7)
-    if A.shape[0] == 7:
+    # Accept time + 5 states (shape 6, N) or time + 6 states (shape 7, N)
+    if A.shape[0] in (6, 7):
         t = A[0, :].ravel()
-        states = A[1:7, :]
-    elif A.shape[1] == 7:
+        states = A[1:, :]
+    elif A.shape[1] in (6, 7):
         t = A[:, 0].ravel()
-        states = A[:, 1:7].T  # make it (6, N)
+        states = A[:, 1:7] if A.shape[1] >= 7 else A[:, 1:6]  # time + 5 or 6 states
+        states = states.T  # make (ns, N)
     else:
         return None, None, None
 
+    # Sanity checks
     if t.size < 2 or not np.all(np.diff(t) > 0) or states.shape[1] != t.size:
         return None, None, None
 
-    return t, states, ANS_LABELS[:]  # copy of labels
+    nstates = states.shape[0]
+    labels = ANS_LABELS[:nstates] if nstates <= len(ANS_LABELS) else [f"State {i+1}" for i in range(nstates)]
+    return t, states, labels
 
+# New: detect a matrix where first row/col is time (monotone), remaining rows/cols are states
+def detect_embedded_time_matrix(data: dict) -> tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[List[str]], Optional[str]]:
+    for k, v in data.items():
+        if not is_numeric_array(v):
+            continue
+        a = np.asarray(v)
+        if a.ndim != 2:
+            continue
+
+        # First row is time
+        if a.shape[1] >= 2 and np.all(np.diff(a[0, :].ravel()) > 0):
+            t = a[0, :].ravel()
+            Y = a[1:, :]
+            if Y.shape[1] == t.size and Y.shape[0] >= 1:
+                nstates = Y.shape[0]
+                labels = ANS_LABELS[:nstates] if nstates <= len(ANS_LABELS) else [f"State {i+1}" for i in range(nstates)]
+                return t, Y, labels, k
+
+        # First column is time
+        if a.shape[0] >= 2 and np.all(np.diff(a[:, 0].ravel()) > 0):
+            t = a[:, 0].ravel()
+            Y = a[:, 1:].T  # rows = states
+            if Y.shape[1] == t.size and Y.shape[0] >= 1:
+                nstates = Y.shape[0]
+                labels = ANS_LABELS[:nstates] if nstates <= len(ANS_LABELS) else [f"State {i+1}" for i in range(nstates)]
+                return t, Y, labels, k
+    return None, None, None, None
 
 def pick_state_indices(spec: str, labels: List[str]) -> List[int]:
     """Parse --states spec into zero-based indices using provided labels list.
@@ -124,7 +156,8 @@ def crop_time(t: np.ndarray, Y: np.ndarray, tmin: Optional[float], tmax: Optiona
 
 
 def plot_states(t: np.ndarray, states: np.ndarray, indices: Iterable[int], labels: List[str],
-                out_file: Path, figsize: Tuple[float, float], dpi: int) -> None:
+                out_file: Path, figsize: Tuple[float, float], dpi: int,
+                y_min: Optional[float] = None, y_max: Optional[float] = None) -> None:
     import matplotlib
     matplotlib.use("Agg", force=True)
     import matplotlib.pyplot as plt
@@ -136,15 +169,19 @@ def plot_states(t: np.ndarray, states: np.ndarray, indices: Iterable[int], label
     fig, ax = plt.subplots(figsize=figsize)
     for i in indices:
         ax.plot(t, states[i, :], linewidth=1.6, label=labels[i] if i < len(labels) else f"State {i+1}")
-    ax.set_xlabel("time [s]")
-    ax.set_ylabel("value")
-    ax.set_title("States over time")
+    ax.set_xlabel("time [s]", fontsize="large")
+    ax.set_ylabel("angle [rad]", fontsize="large")
+    #ax.set_title("States over time")
     ax.grid(True, linestyle="--", alpha=0.6)
-    ax.legend(loc="upper left", fontsize="medium", ncols=1)
+    ax.legend(loc="upper left", fontsize="large", ncols=1)
+    # Apply y-limits if provided
+    if y_min is not None or y_max is not None:
+        cur_ymin, cur_ymax = ax.get_ylim()
+        ax.set_ylim(y_min if y_min is not None else cur_ymin,
+                    y_max if y_max is not None else cur_ymax)
     fig.tight_layout()
     fig.savefig(out_file, dpi=dpi, format="png")
     plt.close(fig)
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Plot selected states from .mat files here.")
@@ -152,14 +189,17 @@ def main() -> None:
                         help='Which states to plot: "all", names (e.g. "pitch,elevation"), or 1-based indices "3,5".')
     parser.add_argument("--tmin", type=float, default=None, help="Min time (seconds) to include")
     parser.add_argument("--tmax", type=float, default=None, help="Max time (seconds) to include")
-    parser.add_argument("--figsize", default="14,6", help="Figure size W,H in inches (default 14,6)")
+    parser.add_argument("--figsize", default="8,7", help="Figure size W,H in inches (default 8,7)")
     parser.add_argument("--dpi", type=int, default=150, help="PNG DPI (default 150)")
+    parser.add_argument("--ymax", type=float, default=None, help="Max y-value (upper axis limit)")
+    parser.add_argument("--ymin", type=float, default=None, help="Min y-value (lower axis limit)")
+    parser.add_argument("--yabs", type=float, default=None, help="Symmetric y-limits [-yabs, +yabs] (overrides --ymin/--ymax)")
     args = parser.parse_args()
 
     try:
         w, h = (float(x) for x in args.figsize.split(","))
     except Exception:
-        w, h = 14.0, 6.0
+        w, h = 8.0, 8.0
     figsize = (w, h)
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -182,56 +222,54 @@ def main() -> None:
             logging.warning("Failed to load %s: %s", mat_path.name, e)
             continue
 
-        # Try the lab 'ans' layout first
+        # Try the lab 'ans' layout first (now supports 5 or 6 states)
         t, Y, labels = load_ans_layout(data)
         suffix = "states"
         if t is None:
-            # Fallback: search for a time vector and a 2D array with >=6 columns
+            # Fallback 1: separate time vector + a 2D matrix
             t, t_key = find_time_vector(data)
+            best_key = None
+            best_arr = None
+            if t is not None:
+                for k, v in data.items():
+                    if k == t_key or not is_numeric_array(v):
+                        continue
+                    a = np.asarray(v)
+                    if a.ndim != 2:
+                        continue
+                    if a.shape[0] == t.size and a.shape[1] >= 1:
+                        best_key, best_arr = k, a
+                        break
+                    if a.shape[1] == t.size and a.shape[0] >= 1 and best_arr is None:
+                        best_key, best_arr = k, a.T  # rows=time
+                if best_arr is not None and best_arr.shape[1] == t.size:
+                    Y = best_arr
+                    labels = ANS_LABELS[:Y.shape[0]] if Y.shape[0] <= len(ANS_LABELS) else [f"State {i+1}" for i in range(Y.shape[0])]
+                    suffix = best_key
+                else:
+                    t = None  # force next fallback
+
+            # Fallback 2: embedded time in first row/col of a 2D array
+            if t is None:
+                t, Y, labels, key = detect_embedded_time_matrix(data)
+                if t is not None:
+                    suffix = key
+
             if t is None:
                 logging.info("Skipping %s (no time vector found).", mat_path.name)
                 continue
 
-            best_key = None
-            best_arr = None
-            # Prefer arrays where rows align with time length and have at least 6 columns
-            for k, v in data.items():
-                if k == t_key:
-                    continue
-                if not is_numeric_array(v):
-                    continue
-                a = np.asarray(v)
-                if a.ndim != 2:
-                    continue
-                if a.shape[0] == t.size and a.shape[1] >= 6:
-                    best_key, best_arr = k, a
-                    break
-                if a.shape[1] == t.size and a.shape[0] >= 6 and best_arr is None:
-                    best_key, best_arr = k, a.T  # transpose to rows=time
-            if best_arr is None:
-                logging.info("Skipping %s (no 2D state-like variable with >=6 columns).", mat_path.name)
-                continue
-
-            # Use first 6 rows as states
-            if best_arr.shape[1] != t.size:
-                logging.info("Skipping %s (states/time length mismatch).", mat_path.name)
-                continue
-            Y = best_arr[:6, :]
-            labels = [f"State {i+1}" for i in range(Y.shape[0])]
-            suffix = best_key
-
-        # Time crop
+        # Time crop and plotting unchanged
         t, Y = crop_time(t, Y, args.tmin, args.tmax)
-
-        # Pick which states to plot
         indices = pick_state_indices(args.states, labels)
-
         out_file = out_dir / f"{mat_path.stem}__{suffix}.png"
-        plot_states(t, Y, indices, labels, out_file, figsize, args.dpi)
+        # Resolve y-limits
+        if args.yabs is not None:
+            y_min, y_max = -abs(args.yabs), abs(args.yabs)
+        else:
+            y_min, y_max = args.ymin, args.ymax
+        plot_states(t, Y, indices, labels, out_file, figsize, args.dpi, y_min=y_min, y_max=y_max)
         logging.info("Saved %s", out_file.name)
-        saved += 1
-
-    logging.info("Done. Saved %d file(s) to %s", saved, out_dir)
 
 
 if __name__ == "__main__":
